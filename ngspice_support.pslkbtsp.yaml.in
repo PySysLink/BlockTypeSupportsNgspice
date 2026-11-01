@@ -1,0 +1,7 @@
+pluginName: ngspice_support
+pluginType: blockTypeSupport
+blockType: Ngspice
+version: @PROJECT_VERSION@
+dependsOn:
+  - name: PySysLinkBase
+    version: @PYSYSLINK_BASE_VERSION@

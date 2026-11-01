@@ -1,0 +1,34 @@
+pluginName: ngspice_blocks
+pluginType: coreBlockLibrary
+blockType: Ngspice
+version: @PROJECT_VERSION@
+dependsOn:
+  - name: BlockTypesNgspice
+    version: @PROJECT_VERSION@
+blockLibraries:
+  - name: NgspiceBlocks
+    blockTypes:
+      - name: Ngspice
+        configurationValues:
+          - name: NetlistPath
+            defaultValue: ""
+            type: string
+          - name: InputSources
+            defaultValue: []
+            type: string[]
+          - name: OutputVectors
+            defaultValue: []
+            type: string[]
+          - name: SampleTime
+            defaultValue: -1
+            type: double
+        inputPortNumber: length(InputSources)
+        outputPortNumber: length(OutputVectors)
+        inputPortTypes:
+          all:
+            port_category: FullySupportedSignalValue
+            signal_value_type: double
+        outputPortTypes:
+          all:
+            port_category: FullySupportedSignalValue
+            signal_value_type: double
