@@ -4,12 +4,12 @@
 #include "NgspiceApi.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -23,45 +23,52 @@ namespace BlockTypeSupports::NgspiceSupport {
 class NgspiceSession {
 public:
     NgspiceSession(
+        const std::string& libraryPath,
         const std::string& netlistPath,
         const std::vector<std::string>& inputSources,
         const std::vector<std::string>& outputVectors)
-        : outputVectors_(outputVectors)
+        : api_(libraryPath),
+          netlistPath_(validateNetlist(netlistPath)),
+          outputVectors_(outputVectors),
+          identifier_(nextIdentifier_++)
     {
-        acquireRuntime();
-        try {
-            configureSources(inputSources);
-            configureOutputs();
-            const auto path = validateNetlist(netlistPath);
-
-            ngSpice_Reset();
-            ngSpice_Init(
-                &sendChar, &sendStatus, &controlledExit, &sendData, &sendInitData,
-                &backgroundThreadRunning, this);
-            ngSpice_Init_Sync(&getVoltageSourceData, &getCurrentSourceData,
-                              nullptr, nullptr, this);
-
-            std::string command = "source " + path.string();
-            if (ngSpice_Command(command.data()) != 0) {
-                throw std::runtime_error(
-                    errorWithDiagnostics("ngspice could not load the netlist"));
-            }
-        } catch (...) {
-            ngSpice_Reset();
-            releaseRuntime();
-            throw;
-        }
+        configureSources(inputSources);
+        configureOutputs();
+        initializeSimulator();
     }
 
     ~NgspiceSession()
     {
         stopSimulation();
-        ngSpice_Reset();
-        releaseRuntime();
+        api_.reset();
     }
 
     NgspiceSession(const NgspiceSession&) = delete;
     NgspiceSession& operator=(const NgspiceSession&) = delete;
+
+    void reset()
+    {
+        stopSimulation();
+        api_.reset();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::fill(inputs_.begin(), inputs_.end(), 0.0);
+            std::fill(latestOutputs_.begin(), latestOutputs_.end(), 0.0);
+            diagnostics_.clear();
+            failure_.clear();
+            targetTime_ = 0.0;
+            lastTargetTime_ = 0.0;
+            latestTime_ = 0.0;
+            started_ = false;
+            backgroundRunning_ = false;
+            analysisComplete_ = false;
+            boundaryReached_ = false;
+            continueSimulation_ = false;
+            shuttingDown_ = false;
+        }
+        identifier_ = nextIdentifier_++;
+        initializeSimulator();
+    }
 
     std::vector<double> advance(
         double startTime,
@@ -93,14 +100,6 @@ public:
         if (!failure_.empty()) {
             throw std::runtime_error(errorWithDiagnostics(failure_));
         }
-        if (analysisComplete_) {
-            throw std::runtime_error(errorWithDiagnostics(
-                "ngspice transient analysis ended before requested endpoint " +
-                std::to_string(targetTime) +
-                " s; increase the .tran stop time to cover the PySysLink "
-                "simulation"));
-        }
-
         if (!started_) {
             if (std::abs(startTime) > timeTolerance(targetTime, stepSize)) {
                 throw std::runtime_error(
@@ -113,15 +112,8 @@ public:
             backgroundRunning_ = true;
             lock.unlock();
 
-            if (ngSpice_SetBkpt(targetTime) == 0) {
-                lock.lock();
-                backgroundRunning_ = false;
-                failure_ = "ngspice could not set the first transient breakpoint";
-                condition_.notify_all();
-                throw std::runtime_error(errorWithDiagnostics(failure_));
-            }
             std::string command = "bg_run";
-            if (ngSpice_Command(command.data()) != 0) {
+            if (api_.command(command.data()) != 0) {
                 lock.lock();
                 backgroundRunning_ = false;
                 failure_ = "ngspice could not start the transient simulation";
@@ -141,24 +133,25 @@ public:
             }
             inputs_ = inputs;
             targetTime_ = targetTime;
-            lock.unlock();
-
-            if (ngSpice_SetBkpt(targetTime) == 0) {
-                throw std::runtime_error(errorWithDiagnostics(
-                    "ngspice could not set the transient breakpoint"));
-            }
-            lock.lock();
             boundaryReached_ = false;
             continueSimulation_ = true;
             condition_.notify_all();
         }
 
         condition_.wait(lock, [this] {
-            return boundaryReached_ || !backgroundRunning_ || !failure_.empty();
+            return boundaryReached_ || analysisComplete_ ||
+                   !backgroundRunning_ || !failure_.empty();
         });
 
         if (!failure_.empty()) {
             throw std::runtime_error(errorWithDiagnostics(failure_));
+        }
+        if (boundaryReached_ ||
+            (analysisComplete_ &&
+             std::abs(latestTime_ - targetTime) <=
+                 timeTolerance(targetTime, stepSize))) {
+            lastTargetTime_ = targetTime;
+            return latestOutputs_;
         }
         if (!boundaryReached_) {
             throw std::runtime_error(errorWithDiagnostics(
@@ -176,6 +169,32 @@ private:
     struct InputSource {
         char type;
         std::size_t portIndex;
+    };
+
+    class CallbackGuard {
+    public:
+        explicit CallbackGuard(NgspiceSession* session) : session_(session)
+        {
+            if (session_ != nullptr) {
+                std::lock_guard<std::mutex> lock(session_->mutex_);
+                ++session_->callbacksInFlight_;
+            }
+        }
+
+        ~CallbackGuard()
+        {
+            if (session_ != nullptr) {
+                std::lock_guard<std::mutex> lock(session_->mutex_);
+                --session_->callbacksInFlight_;
+                session_->condition_.notify_all();
+            }
+        }
+
+        CallbackGuard(const CallbackGuard&) = delete;
+        CallbackGuard& operator=(const CallbackGuard&) = delete;
+
+    private:
+        NgspiceSession* session_;
     };
 
     static std::string normalize(const std::string& value)
@@ -207,26 +226,26 @@ private:
         return std::max(1e-15, 1e-9 * std::max(std::abs(time), stepSize));
     }
 
-    void acquireRuntime()
+    void initializeSimulator()
     {
-        std::lock_guard<std::mutex> lock(runtimeMutex_);
-        if (runtimeInUse_) {
-            throw std::runtime_error(
-                "The ngspice shared library supports one active Ngspice block "
-                "per process");
-        }
-        runtimeInUse_ = true;
-        ownsRuntime_ = true;
-    }
+        api_.reset();
+        try {
+            api_.init(
+                &sendChar, &sendStatus, &controlledExit, &sendData, &sendInitData,
+                &backgroundThreadRunning, this);
+            api_.initSync(
+                &getVoltageSourceData, &getCurrentSourceData, &getSyncData,
+                &identifier_, this);
 
-    void releaseRuntime()
-    {
-        if (!ownsRuntime_) {
-            return;
+            std::string command = "source " + netlistPath_.string();
+            if (api_.command(command.data()) != 0) {
+                throw std::runtime_error(
+                    errorWithDiagnostics("ngspice could not load the netlist"));
+            }
+        } catch (...) {
+            api_.reset();
+            throw;
         }
-        std::lock_guard<std::mutex> lock(runtimeMutex_);
-        runtimeInUse_ = false;
-        ownsRuntime_ = false;
     }
 
     void configureSources(const std::vector<std::string>& inputSources)
@@ -336,19 +355,19 @@ private:
             condition_.notify_all();
         }
 
-        bool shouldWait = false;
+        bool shouldHalt = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            shouldWait = started_ && backgroundRunning_;
+            shouldHalt = backgroundRunning_;
         }
-        if (shouldWait) {
+        if (shouldHalt) {
             std::string command = "bg_halt";
-            if (ngSpice_Command(command.data()) != 0) {
-                std::cerr << "Could not halt the ngspice background simulation\n";
-            }
-            std::unique_lock<std::mutex> lock(mutex_);
-            condition_.wait(lock, [this] { return !backgroundRunning_; });
+            api_.command(command.data());
         }
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [this] {
+            return !backgroundRunning_ && callbacksInFlight_ == 0;
+        });
     }
 
     void recordCallbackFailure(const std::string& message)
@@ -402,28 +421,63 @@ private:
             latestOutputs_[index] = found->second;
         }
 
-        if (!started_ || time < targetTime_ -
-                                  timeTolerance(targetTime_, targetTime_)) {
-            return;
+        latestTime_ = time;
+        condition_.notify_all();
+    }
+
+    int onSyncData(
+        double time,
+        double* deltaTime,
+        int redoStep,
+        int instanceIdentifier,
+        int location)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (instanceIdentifier != identifier_) {
+            failure_ =
+                "ngspice synchronization callback identified an unexpected "
+                "library instance";
+            condition_.notify_all();
+            return 0;
+        }
+        if (!failure_.empty() || shuttingDown_ || !started_) {
+            return 0;
         }
 
         const double tolerance =
             timeTolerance(targetTime_, targetTime_ - lastTargetTime_);
-        if (std::abs(time - targetTime_) > tolerance) {
-            failure_ = "ngspice transient output time " + std::to_string(time) +
-                       " does not match requested discrete time " +
-                       std::to_string(targetTime_) +
-                       "; ngspice did not reach the requested breakpoint";
-            condition_.notify_all();
-            return;
-        }
+        if (location == 0 && redoStep == 0) {
+            if (time > targetTime_ + tolerance) {
+                failure_ =
+                    "ngspice advanced past the requested discrete endpoint";
+                condition_.notify_all();
+                return 0;
+            }
+            if (std::abs(time - targetTime_) <= tolerance) {
+                boundaryReached_ = true;
+                condition_.notify_all();
+                condition_.wait(lock, [this] {
+                    return continueSimulation_ || shuttingDown_ ||
+                           !failure_.empty();
+                });
+                continueSimulation_ = false;
+                return 0;
+            }
 
-        boundaryReached_ = true;
-        condition_.notify_all();
-        condition_.wait(lock, [this] {
-            return continueSimulation_ || shuttingDown_;
-        });
-        continueSimulation_ = false;
+            if (deltaTime == nullptr || !std::isfinite(*deltaTime)) {
+                failure_ = "ngspice supplied an invalid transient time step";
+                condition_.notify_all();
+                return 0;
+            }
+            if (*deltaTime <= 0.0) {
+                return 0;
+            }
+            const double remaining = targetTime_ - time;
+            if (*deltaTime > remaining) {
+                *deltaTime = remaining;
+            }
+        }
+        return 0;
     }
 
     double sourceValue(char* name, char expectedType)
@@ -449,6 +503,7 @@ private:
         if (session == nullptr || text == nullptr) {
             return 0;
         }
+        CallbackGuard callbackGuard(session);
         try {
             std::lock_guard<std::mutex> lock(session->mutex_);
             const std::string message(text);
@@ -471,10 +526,12 @@ private:
         return 0;
     }
 
-    static int controlledExit(int status, int, int, int, void* userData) noexcept
+    static int controlledExit(
+        int status, int, int, int, void* userData) noexcept
     {
         auto* session = static_cast<NgspiceSession*>(userData);
         if (session != nullptr) {
+            CallbackGuard callbackGuard(session);
             try {
                 std::lock_guard<std::mutex> lock(session->mutex_);
                 session->failure_ =
@@ -490,10 +547,14 @@ private:
     }
 
     static int sendData(
-        NgspiceVecValuesAll* values, int vectorCount, int, void* userData) noexcept
+        NgspiceVecValuesAll* values,
+        int vectorCount,
+        int,
+        void* userData) noexcept
     {
         auto* session = static_cast<NgspiceSession*>(userData);
         if (session != nullptr) {
+            CallbackGuard callbackGuard(session);
             try {
                 session->onData(values, vectorCount);
             } catch (...) {
@@ -509,10 +570,12 @@ private:
         return 0;
     }
 
-    static int backgroundThreadRunning(int notRunning, int, void* userData) noexcept
+    static int backgroundThreadRunning(
+        int notRunning, int, void* userData) noexcept
     {
         auto* session = static_cast<NgspiceSession*>(userData);
         if (session != nullptr) {
+            CallbackGuard callbackGuard(session);
             try {
                 std::lock_guard<std::mutex> lock(session->mutex_);
                 session->backgroundRunning_ = (notRunning == 0);
@@ -524,12 +587,17 @@ private:
     }
 
     static int getVoltageSourceData(
-        double* value, double, char* name, int, void* userData) noexcept
+        double* value,
+        double,
+        char* name,
+        int,
+        void* userData) noexcept
     {
         auto* session = static_cast<NgspiceSession*>(userData);
         if (session == nullptr || value == nullptr) {
             return 0;
         }
+        CallbackGuard callbackGuard(session);
         try {
             *value = session->sourceValue(name, 'v');
         } catch (...) {
@@ -540,12 +608,17 @@ private:
     }
 
     static int getCurrentSourceData(
-        double* value, double, char* name, int, void* userData) noexcept
+        double* value,
+        double,
+        char* name,
+        int,
+        void* userData) noexcept
     {
         auto* session = static_cast<NgspiceSession*>(userData);
         if (session == nullptr || value == nullptr) {
             return 0;
         }
+        CallbackGuard callbackGuard(session);
         try {
             *value = session->sourceValue(name, 'i');
         } catch (...) {
@@ -555,12 +628,37 @@ private:
         return 0;
     }
 
-    inline static std::mutex runtimeMutex_;
-    inline static bool runtimeInUse_ = false;
+    static int getSyncData(
+        double time,
+        double* deltaTime,
+        double,
+        int redoStep,
+        int instanceIdentifier,
+        int location,
+        void* userData) noexcept
+    {
+        auto* session = static_cast<NgspiceSession*>(userData);
+        if (session == nullptr) {
+            return 0;
+        }
+        CallbackGuard callbackGuard(session);
+        try {
+            return session->onSyncData(
+                time, deltaTime, redoStep, instanceIdentifier, location);
+        } catch (...) {
+            session->recordCallbackFailure(
+                "An exception occurred in the ngspice synchronization callback");
+            return 0;
+        }
+    }
 
-    bool ownsRuntime_ = false;
+    inline static std::atomic<int> nextIdentifier_{1};
+
+    NgspiceApi api_;
     std::mutex mutex_;
     std::condition_variable condition_;
+    std::size_t callbacksInFlight_ = 0;
+    std::filesystem::path netlistPath_;
     std::vector<std::string> inputSources_;
     std::vector<std::string> outputVectors_;
     std::vector<double> inputs_;
@@ -568,8 +666,10 @@ private:
     std::unordered_map<std::string, InputSource> sources_;
     std::string diagnostics_;
     std::string failure_;
+    int identifier_ = 0;
     double targetTime_ = 0.0;
     double lastTargetTime_ = 0.0;
+    double latestTime_ = 0.0;
     bool started_ = false;
     bool backgroundRunning_ = false;
     bool analysisComplete_ = false;

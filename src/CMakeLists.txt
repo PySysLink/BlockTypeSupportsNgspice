@@ -51,7 +51,6 @@ target_link_libraries(BlockTypeSupportsNgspiceSupport
         spdlog::spdlog_header_only
         fmt::fmt
         Eigen3::Eigen
-        ${NGSPICE_LIBRARY}
         ${CMAKE_DL_LIBS}
 )
 

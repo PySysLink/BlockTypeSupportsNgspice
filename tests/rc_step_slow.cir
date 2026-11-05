@@ -1,0 +1,6 @@
+RC input step test with slower response
+Vdrive in 0 dc 0 external
+R1 in out 2k
+C1 out 0 1u
+.tran 1m 21m 0 1m uic
+.end

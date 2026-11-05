@@ -42,8 +42,11 @@ public:
         const auto netlistPath =
             PySysLinkBase::ConfigurationValueManager::TryGetConfigurationValue<
                 std::string>("NetlistPath", configuration);
+        const auto ngspiceLibraryPath =
+            PySysLinkBase::ConfigurationValueManager::TryGetConfigurationValue<
+                std::string>("NgspiceLibraryPath", configuration);
         session_ = std::make_unique<NgspiceSession>(
-            netlistPath, inputSources_, outputVectors_);
+            ngspiceLibraryPath, netlistPath, inputSources_, outputVectors_);
 
         const double sampleTime =
             PySysLinkBase::ConfigurationValueManager::TryGetConfigurationValue<

@@ -25,49 +25,36 @@ set(PLUGIN_INSTALL_DIR
 
 find_package(PySysLinkBase ${PYSYSLINK_BASE_VERSION} REQUIRED)
 
-option(
-    NGSPICE_PREFER_STATIC
-    "Prefer a static ngspice library when libngspice.a is installed"
-    ON)
-
-if(NGSPICE_PREFER_STATIC)
-    set(_NGSPICE_SAVED_LIBRARY_SUFFIXES ${CMAKE_FIND_LIBRARY_SUFFIXES})
-    set(CMAKE_FIND_LIBRARY_SUFFIXES .a)
-    find_library(NGSPICE_STATIC_LIBRARY NAMES ngspice)
-    set(CMAKE_FIND_LIBRARY_SUFFIXES ${_NGSPICE_SAVED_LIBRARY_SUFFIXES})
-    unset(_NGSPICE_SAVED_LIBRARY_SUFFIXES)
-endif()
-
-if(NGSPICE_PREFER_STATIC AND NGSPICE_STATIC_LIBRARY)
-    set(NGSPICE_LIBRARY "${NGSPICE_STATIC_LIBRARY}")
-    message(STATUS "Using static ngspice library: ${NGSPICE_LIBRARY}")
-else()
-    find_library(NGSPICE_LIBRARY NAMES ngspice libngspice.so.0)
-    if(NGSPICE_PREFER_STATIC)
-        message(STATUS
-            "libngspice.a was not found; falling back to the ngspice shared library")
-    endif()
-endif()
-
-if(NOT NGSPICE_LIBRARY)
-    message(FATAL_ERROR "Could not find an ngspice library")
-endif()
-
 add_subdirectory(src)
 
 include(CTest)
 if(BUILD_TESTING)
+    set(
+        NGSPICE_TEST_LIBRARY_PATH
+        ""
+        CACHE FILEPATH
+        "Explicit ngspice shared-library path used only by integration tests")
     add_executable(ngspice_block_test tests/ngspice_block_test.cpp)
+    add_dependencies(ngspice_block_test BlockTypeSupportsNgspiceSupport)
     target_include_directories(ngspice_block_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(ngspice_block_test
         PRIVATE
             PySysLinkBase::PySysLinkBase
-            ${NGSPICE_LIBRARY})
-    add_test(
-        NAME ngspice_block_test
-        COMMAND ngspice_block_test
-            ${CMAKE_CURRENT_SOURCE_DIR}/tests/rc_step.cir)
-    set_tests_properties(ngspice_block_test PROPERTIES TIMEOUT 10)
+            ${CMAKE_DL_LIBS})
+    if(NGSPICE_TEST_LIBRARY_PATH)
+        add_test(
+            NAME ngspice_block_test
+            COMMAND ngspice_block_test
+                ${NGSPICE_TEST_LIBRARY_PATH}
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/rc_step.cir
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/rc_step_slow.cir
+                $<TARGET_FILE:BlockTypeSupportsNgspiceSupport>)
+        set_tests_properties(ngspice_block_test PROPERTIES TIMEOUT 20)
+    else()
+        message(STATUS
+            "Ngspice integration test disabled; set NGSPICE_TEST_LIBRARY_PATH "
+            "to run it")
+    endif()
 endif()
 
 install(DIRECTORY src/

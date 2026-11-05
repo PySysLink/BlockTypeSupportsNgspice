@@ -13,6 +13,9 @@ blockLibraries:
           - name: NetlistPath
             defaultValue: ""
             type: string
+          - name: NgspiceLibraryPath
+            defaultValue: ""
+            type: string
           - name: InputSources
             defaultValue: []
             type: string[]
